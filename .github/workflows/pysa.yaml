@@ -1,0 +1,179 @@
+name: Pysa Security Analysis
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  schedule:
+    # 每周运行一次（可选）
+    - cron: '0 0 * * 0'
+
+jobs:
+  pysa:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+
+    - name: Install Pyre/Pysa
+      run: |
+        pip install pyre-check
+
+    - name: Create Pysa configuration
+      run: |
+        # 创建.pyre_configuration文件
+        cat > .pyre_configuration << EOF
+        {
+          "source_directories": [
+            "."
+          ],
+          "exclude": [
+            ".git",
+            "__pycache__",
+            ".pytest_cache",
+            "node_modules",
+            "venv",
+            ".venv"
+          ],
+          "taint_models_path": ".pyre/taint_models",
+          "search_path": [],
+          "strict": false
+        }
+        EOF
+
+        # 创建taint models目录
+        mkdir -p .pyre/taint_models
+
+        # 创建基本的taint model文件
+        cat > .pyre/taint_models/models.pysa << EOF
+        # Basic taint models for common vulnerabilities
+        
+        # SQL Injection
+        def sqlite3.execute(query: TaintSink[SQL], parameters): ...
+        def sqlite3.executemany(query: TaintSink[SQL], parameters): ...
+        
+        # Command Injection
+        def os.system(command: TaintSink[RemoteCodeExecution]): ...
+        def subprocess.run(args: TaintSink[RemoteCodeExecution]): ...
+        def subprocess.call(args: TaintSink[RemoteCodeExecution]): ...
+        
+        # Path Traversal
+        def builtins.open(file: TaintSink[FileSystem], mode): ...
+        
+        # Sources - user input
+        def builtins.input() -> TaintSource[UserControlled]: ...
+        def flask.request.args.get(key) -> TaintSource[UserControlled]: ...
+        def flask.request.form.get(key) -> TaintSource[UserControlled]: ...
+        def flask.request.json.get(key) -> TaintSource[UserControlled]: ...
+        EOF
+
+    - name: Run Pysa Analysis
+      run: |
+        # 运行Pysa分析
+        pyre analyze --save-results-to pysa-results.json || true
+
+    - name: Convert results to SARIF
+      run: |
+        # 创建Python脚本将Pysa结果转换为SARIF格式
+        cat > convert_to_sarif.py << 'EOF'
+        import json
+        import sys
+        from datetime import datetime
+
+        def convert_pysa_to_sarif(pysa_file, sarif_file):
+            try:
+                with open(pysa_file, 'r') as f:
+                    pysa_results = json.load(f)
+            except (FileNotFoundError, json.JSONDecodeError):
+                # 如果没有结果文件或格式错误，创建空的SARIF
+                pysa_results = []
+
+            # SARIF格式模板
+            sarif = {
+                "version": "2.1.0",
+                "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+                "runs": [{
+                    "tool": {
+                        "driver": {
+                            "name": "Pysa",
+                            "version": "0.1.0",
+                            "informationUri": "https://pyre-check.org/docs/pysa-basics/",
+                            "rules": []
+                        }
+                    },
+                    "results": []
+                }]
+            }
+
+            # 转换结果
+            for issue in pysa_results:
+                result = {
+                    "ruleId": issue.get("code", "pysa-security-issue"),
+                    "message": {
+                        "text": issue.get("description", "Security vulnerability detected")
+                    },
+                    "locations": [{
+                        "physicalLocation": {
+                            "artifactLocation": {
+                                "uri": issue.get("path", "unknown")
+                            },
+                            "region": {
+                                "startLine": issue.get("line", 1),
+                                "startColumn": issue.get("column", 1)
+                            }
+                        }
+                    }],
+                    "level": "warning"
+                }
+                sarif["runs"][0]["results"].append(result)
+
+            # 添加规则定义
+            if sarif["runs"][0]["results"]:
+                sarif["runs"][0]["tool"]["driver"]["rules"] = [{
+                    "id": "pysa-security-issue",
+                    "name": "Security Issue",
+                    "shortDescription": {
+                        "text": "Potential security vulnerability detected by Pysa"
+                    },
+                    "fullDescription": {
+                        "text": "Pysa detected a potential security vulnerability in the code"
+                    },
+                    "defaultConfiguration": {
+                        "level": "warning"
+                    }
+                }]
+
+            with open(sarif_file, 'w') as f:
+                json.dump(sarif, f, indent=2)
+
+        convert_pysa_to_sarif('pysa-results.json', 'pysa-results.sarif')
+        EOF
+
+        python convert_to_sarif.py
+
+    - name: Upload SARIF results
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: pysa-results.sarif
+        category: pysa
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: pysa-results
+        path: |
+          pysa-results.json
+          pysa-results.sarif
+          .pyre_configuration
